@@ -1693,6 +1693,75 @@ describe("plugin runtime preparation", () => {
     ]);
   });
 
+  test("reuses an unchanged installed plugin across repeated bootstraps", async () => {
+    const root = await temporaryDirectory();
+    const selected = await plugin(root);
+    const home = join(root, "home");
+    await mkdir(home);
+    await writeFile(join(home, "config.toml"), "[features]\nplugins = true\n");
+
+    const installed = join(
+      home,
+      "plugins",
+      "cache",
+      "codex-security-sdk",
+      "codex-security",
+      "1.2.3",
+    );
+    const calls: string[][] = [];
+
+    const runCodex: NonNullable<
+      NonNullable<Parameters<typeof bootstrapPlugin>[2]>["runCodex"]
+    > = async (_command, args) => {
+      calls.push([...args]);
+
+      if (args[1] === "marketplace") {
+        await writeFile(
+          join(home, "config.toml"),
+          `\n[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ${JSON.stringify(join(home, "sdk-marketplace"))}\n`,
+          { flag: "a" },
+        );
+        return "";
+      }
+
+      await writeFile(
+        join(home, "config.toml"),
+        '\n[plugins."codex-security@codex-security-sdk"]\nenabled = true\n',
+        { flag: "a" },
+      );
+      await mkdir(join(installed, ".codex-plugin"), { recursive: true });
+      await writeFile(
+        join(installed, ".codex-plugin", "plugin.json"),
+        JSON.stringify({ name: "codex-security", version: "1.2.3" }),
+      );
+      await mkdir(join(installed, "scripts"));
+      await writeFile(
+        join(installed, "scripts", "helper.py"),
+        "print('ok')\n",
+      );
+      return JSON.stringify({
+        installedPath: installed,
+        version: "1.2.3",
+      });
+    };
+
+    const first = await bootstrapPlugin(home, selected, {
+      codexCommand: { command: "/codex" },
+      runCodex,
+    });
+
+    const second = await bootstrapPlugin(home, selected, {
+      codexCommand: { command: "/codex" },
+      runCodex,
+    });
+
+    expect(first.installedRoot).toBe(installed);
+    expect(second.installedRoot).toBe(installed);
+    expect(calls).toEqual([
+      ["plugin", "marketplace", "add", join(home, "sdk-marketplace")],
+      ["plugin", "add", "--json", "codex-security@codex-security-sdk"],
+    ]);
+  });
   test("does not preserve a different marketplace when numeric identities collide", async () => {
     const root = await temporaryDirectory();
     const home = join(root, "home");
