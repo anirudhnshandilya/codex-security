@@ -2566,6 +2566,8 @@ export async function bootstrapPlugin(
     ? plugins[`${PLUGIN_NAME}@${MARKETPLACE_NAME}`]
     : undefined;
 
+  // Codex replaces the shared install even at the same version. Reuse it so
+  // workers from an earlier scan can keep using their plugin files.
   if (
     stagedMatches &&
     registered &&

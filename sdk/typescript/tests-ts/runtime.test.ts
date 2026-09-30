@@ -5,6 +5,7 @@ import { existsSync, renameSync, symlinkSync } from "node:fs";
 import {
   chmod,
   copyFile,
+  cp,
   link,
   lstat,
   mkdir,
@@ -1693,75 +1694,147 @@ describe("plugin runtime preparation", () => {
     ]);
   });
 
-  test("reuses an unchanged installed plugin across repeated bootstraps", async () => {
-    const root = await temporaryDirectory();
-    const selected = await plugin(root);
-    const home = join(root, "home");
-    await mkdir(home);
-    await writeFile(join(home, "config.toml"), "[features]\nplugins = true\n");
+  describe("installed plugin reuse", () => {
+    async function fixture() {
+      const root = await temporaryDirectory();
+      const selected = await plugin(root);
+      const home = join(root, "home");
+      const marketplace = join(home, "sdk-marketplace");
+      const staged = join(marketplace, "plugins", "codex-security");
+      const installed = join(home, "installed", "1.2.3");
+      const record = join(marketplace, "installed-plugin.json");
+      const configuration = `[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ${JSON.stringify(marketplace)}\n`;
+      const calls: string[][] = [];
+      await mkdir(home);
+      const bootstrap = () =>
+        bootstrapPlugin(home, selected, {
+          codexCommand: { command: "/codex" },
+          runCodex: async (_command, args) => {
+            calls.push([...args]);
+            if (args[1] === "marketplace") {
+              await writeFile(join(home, "config.toml"), configuration);
+              return "";
+            }
+            await rm(installed, { recursive: true, force: true });
+            await cp(staged, installed, { recursive: true });
+            await writeFile(
+              join(home, "config.toml"),
+              `${configuration}\n[plugins."codex-security@codex-security-sdk"]\nenabled = true\n`,
+            );
+            return JSON.stringify({
+              installedPath: installed,
+              version: "1.2.3",
+            });
+          },
+        });
+      await bootstrap();
+      return { selected, home, staged, installed, record, calls, bootstrap };
+    }
 
-    const installed = join(
-      home,
-      "plugins",
-      "cache",
-      "codex-security-sdk",
-      "codex-security",
-      "1.2.3",
+    test("preserves generated installed files during reuse", async () => {
+      const { installed, calls, bootstrap } = await fixture();
+      const generated = join(installed, "scripts", "__pycache__", "helper.pyc");
+      await mkdir(dirname(generated));
+      await writeFile(generated, "generated cache");
+
+      expect((await bootstrap()).installedRoot).toBe(installed);
+      expect(calls.filter((args) => args[1] === "add")).toHaveLength(1);
+      expect(await readFile(generated, "utf8")).toBe("generated cache");
+    });
+
+    test.each(["changed", "added", "removed"] as const)(
+      "refreshes %s same-version source files",
+      async (change) => {
+        const { selected, staged, installed, bootstrap } = await fixture();
+        const name = change === "added" ? "added.py" : "helper.py";
+        const source = join(selected, "scripts", name);
+        if (change === "removed") {
+          await rm(source);
+        } else {
+          // Same length as the original helper, so byte comparison must detect it.
+          await writeFile(source, "print('no')\n");
+        }
+
+        await bootstrap();
+
+        for (const root of [staged, installed]) {
+          const path = join(root, "scripts", name);
+          if (change === "removed") {
+            expect(existsSync(path)).toBe(false);
+          } else {
+            expect(await readFile(path, "utf8")).toBe("print('no')\n");
+          }
+        }
+      },
     );
-    const calls: string[][] = [];
 
-    const runCodex: NonNullable<
-      NonNullable<Parameters<typeof bootstrapPlugin>[2]>["runCodex"]
-    > = async (_command, args) => {
-      calls.push([...args]);
+    testPosix("refreshes changed source executable permissions", async () => {
+      const { selected, staged, installed, bootstrap } = await fixture();
+      await chmod(join(selected, "scripts", "helper.py"), 0o750);
 
-      if (args[1] === "marketplace") {
-        await writeFile(
-          join(home, "config.toml"),
-          `\n[marketplaces.codex-security-sdk]\nsource_type = "local"\nsource = ${JSON.stringify(join(home, "sdk-marketplace"))}\n`,
-          { flag: "a" },
-        );
-        return "";
+      await bootstrap();
+
+      for (const root of [staged, installed]) {
+        expect(
+          (await stat(join(root, "scripts", "helper.py"))).mode & 0o111,
+        ).toBe(0o110);
+      }
+    });
+
+    test.each([
+      "missing file",
+      "changed file",
+      "missing record",
+      "invalid record",
+      "disabled plugin",
+      "missing registration",
+      "extra staged file",
+    ])("repairs %s before reusing the installation", async (damage) => {
+      const { home, staged, installed, record, calls, bootstrap } =
+        await fixture();
+      const helper = join(installed, "scripts", "helper.py");
+      switch (damage) {
+        case "missing file":
+          await rm(helper);
+          break;
+        case "changed file":
+          await writeFile(helper, "print('no')\n");
+          break;
+        case "missing record":
+          await rm(record);
+          break;
+        case "invalid record":
+          await writeFile(record, "{");
+          break;
+        case "disabled plugin": {
+          const config = await readFile(join(home, "config.toml"), "utf8");
+          await writeFile(
+            join(home, "config.toml"),
+            config.replace("enabled = true", "enabled = false"),
+          );
+          break;
+        }
+        case "missing registration":
+          await writeFile(join(home, "config.toml"), "");
+          break;
+        case "extra staged file":
+          await writeFile(join(staged, "stale.py"), "pass\n");
+          break;
       }
 
-      await writeFile(
-        join(home, "config.toml"),
-        '\n[plugins."codex-security@codex-security-sdk"]\nenabled = true\n',
-        { flag: "a" },
-      );
-      await mkdir(join(installed, ".codex-plugin"), { recursive: true });
-      await writeFile(
-        join(installed, ".codex-plugin", "plugin.json"),
-        JSON.stringify({ name: "codex-security", version: "1.2.3" }),
-      );
-      await mkdir(join(installed, "scripts"));
-      await writeFile(
-        join(installed, "scripts", "helper.py"),
-        "print('ok')\n",
-      );
-      return JSON.stringify({
+      await bootstrap();
+      expect(calls.filter((args) => args[1] === "add")).toHaveLength(2);
+      expect(await readFile(helper, "utf8")).toBe("print('ok')\n");
+      expect(existsSync(join(staged, "stale.py"))).toBe(false);
+      expect(JSON.parse(await readFile(record, "utf8"))).toEqual({
         installedPath: installed,
         version: "1.2.3",
       });
-    };
-
-    const first = await bootstrapPlugin(home, selected, {
-      codexCommand: { command: "/codex" },
-      runCodex,
+      await bootstrap();
+      expect(calls.filter((args) => args[1] === "add")).toHaveLength(2);
     });
-
-    const second = await bootstrapPlugin(home, selected, {
-      codexCommand: { command: "/codex" },
-      runCodex,
-    });
-
-    expect(first.installedRoot).toBe(installed);
-    expect(second.installedRoot).toBe(installed);
-    expect(calls).toEqual([
-      ["plugin", "marketplace", "add", join(home, "sdk-marketplace")],
-      ["plugin", "add", "--json", "codex-security@codex-security-sdk"],
-    ]);
   });
+
   test("does not preserve a different marketplace when numeric identities collide", async () => {
     const root = await temporaryDirectory();
     const home = join(root, "home");
