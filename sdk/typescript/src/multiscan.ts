@@ -105,6 +105,11 @@ export interface MultiscanOptions extends ScanPromptSettings {
   }): void;
 }
 
+export interface MultiscanWarning {
+  repository: string;
+  warnings: string[];
+}
+
 export interface MultiscanResult {
   total: number;
   completed: number;
@@ -112,6 +117,7 @@ export interface MultiscanResult {
   failed: number;
   skipped: number;
   resultsPath: string;
+  warnings?: MultiscanWarning[];
   policyFailed?: boolean;
 }
 
@@ -223,6 +229,7 @@ async function runCampaign(
   let completed = 0;
   let incomplete = 0;
   let policyFailed = false;
+  const campaignWarnings = new Map<string, string[]>();
   const hasPolicy = Object.values(options.scanOptionsByMode ?? {}).some(
     (settings) => settings.failureSeverity !== undefined,
   );
@@ -261,7 +268,11 @@ async function runCampaign(
       (await hasArtifacts(artifactOutput))
     ) {
       if (receipt.status !== "failed") {
-        for (const warning of receipt.warnings ?? []) {
+        const warnings = receipt.warnings ?? [];
+        if (warnings.length > 0) {
+          campaignWarnings.set(task.id, [...warnings]);
+        }
+        for (const warning of warnings) {
           notifyProgress(options, {
             repository: task.id,
             status: receipt.status,
@@ -299,7 +310,15 @@ async function runCampaign(
     pending.push(task);
   }
   const skipped = completed + incomplete + untouched;
+  const campaignWarningSummary = () =>
+    tasks.flatMap((task) => {
+      const warnings = campaignWarnings.get(task.id);
+      return warnings === undefined || warnings.length === 0
+        ? []
+        : [{ repository: task.id, warnings }];
+    });
   if (pending.length === 0) {
+    const warnings = campaignWarningSummary();
     return {
       total: tasks.length,
       completed,
@@ -307,6 +326,7 @@ async function runCampaign(
       failed: 0,
       skipped,
       resultsPath: ledger,
+      ...(warnings.length === 0 ? {} : { warnings }),
       ...(hasPolicy ? { policyFailed } : {}),
     };
   }
@@ -517,6 +537,9 @@ async function runCampaign(
         });
         if (failure === undefined) {
           policyFailed ||= attemptPolicyFailed === true;
+          if (runWarnings.length > 0) {
+            campaignWarnings.set(task.id, [...runWarnings]);
+          }
           if (warning === undefined) completed += 1;
           else incomplete += 1;
           break;
@@ -544,6 +567,7 @@ async function runCampaign(
   );
   const rejection = results.find((result) => result.status === "rejected");
   if (rejection?.status === "rejected") throw rejection.reason;
+  const warnings = campaignWarningSummary();
   return {
     total: tasks.length,
     completed,
@@ -551,6 +575,7 @@ async function runCampaign(
     failed,
     skipped,
     resultsPath: ledger,
+    ...(warnings.length === 0 ? {} : { warnings }),
     ...(hasPolicy ? { policyFailed } : {}),
   };
 }

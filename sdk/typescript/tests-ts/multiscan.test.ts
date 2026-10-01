@@ -812,7 +812,20 @@ describe("multiscan", () => {
       ),
     );
 
-    expect(summary).toMatchObject({ completed: 1, incomplete: 0, failed: 0 });
+    expect(summary).toMatchObject({
+      completed: 1,
+      incomplete: 0,
+      failed: 0,
+      warnings: [
+        {
+          repository: "follow-up-warning",
+          warnings: [
+            "Could not run post-scan instructions.",
+            "Repository changed during the scan.",
+          ],
+        },
+      ],
+    });
     expect(progress).toContainEqual({
       repository: "follow-up-warning",
       attempt: 1,
@@ -841,7 +854,20 @@ describe("multiscan", () => {
       ),
     );
 
-    expect(resumed).toMatchObject({ completed: 1, skipped: 1, failed: 0 });
+    expect(resumed).toMatchObject({
+      completed: 1,
+      skipped: 1,
+      failed: 0,
+      warnings: [
+        {
+          repository: "follow-up-warning",
+          warnings: [
+            "Could not run post-scan instructions.",
+            "Repository changed during the scan.",
+          ],
+        },
+      ],
+    });
     expect(resumedProgress).toEqual(
       expect.arrayContaining([
         {
